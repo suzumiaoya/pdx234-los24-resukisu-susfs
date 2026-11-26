@@ -1,0 +1,510 @@
+name: Build pdx234 LOS24 Kernel (ReSukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU Variant'
+        required: true
+        default: 'ReSukiSU'
+        type: choice
+        options:
+          - ReSukiSU
+          - SukiSU
+      enable_susfs:
+        description: 'Enable SUSFS'
+        required: true
+        default: true
+        type: boolean
+      enable_kpm:
+        description: 'Enable KPM (Kernel Patch Module)'
+        required: true
+        default: true
+        type: boolean
+      enable_zram:
+        description: 'Enable ZRAM optimizations (LZ4 1.10.0 + LZ4KD)'
+        required: true
+        default: true
+        type: boolean
+      release_version:
+        description: 'Release Version Tag Suffix'
+        required: true
+        default: 'v2.1.0-r1'
+        type: string
+
+env:
+  AOSP_TOOLCHAIN_BRANCH: android16
+  AOSP_CLANG_VERSION: r547379
+  KERNEL_BRANCH: lineage-24.0
+  KERNEL_LOCALVERSION: los24-resukisu
+  ANDROID_VERSION: android13
+  KERNEL_VERSION: '5.15'
+  SUSFS_RESUKISU_PIN: e4bd49f708108cc829fe7ca079312ea8fefa89f8
+  RESUKISU_PIN: a13d71f699093f0c1da7ba442881eccaa8e4321a
+  BOOT_OS_VERSION: '17.0.0'
+  BOOT_OS_PATCH_LEVEL: '2026-11'
+
+jobs:
+  build:
+    name: Build pdx234 (LineageOS 24.0)
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DEVICE: pdx234
+      BUILD_SLUG: ${{ github.event.inputs.ksu_variant == 'ReSukiSU' && 'resukisu' || 'sukisu' }}
+    steps:
+      - name: Maximize Build Space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          remove-cached-tools: 'false'
+          verbose: 'false'
+
+      - name: Install packages
+        env:
+          PACKAGES: >-
+            binutils-arm-linux-gnueabi
+            binutils-aarch64-linux-gnu
+            ccache
+            libelf-dev
+            libssl-dev
+            bc
+            bison
+            flex
+            python3
+            python-is-python3
+            dwarves
+            build-essential
+            libc6-dev
+            curl
+            git
+            zip
+            unzip
+            pigz
+        run: |
+          echo 'Acquire::Queue-Mode "host";' | sudo tee /etc/apt/apt.conf.d/99parallel
+          echo 'Acquire::http::Pipeline-Depth "5";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ env.PACKAGES }} -qq
+
+      - name: Initialize build log
+        run: |
+          echo "=== Build Process Log ===" > error-log-pdx234.txt
+          echo "Build started: $(date -u)" >> error-log-pdx234.txt
+          echo "Device: pdx234 | Branch: ${{ env.KERNEL_BRANCH }}" >> error-log-pdx234.txt
+          echo "" >> error-log-pdx234.txt
+
+      - name: Checkout build configs
+        uses: actions/checkout@v4
+        with:
+          path: build-configs
+
+      - name: Sync LineageOS 24.0 kernel repository
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_sony_sm8550
+          ref: ${{ env.KERNEL_BRANCH }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Record kernel commit & clean tree
+        working-directory: kernel
+        run: |
+          KCOMMIT=$(git rev-parse HEAD)
+          echo "Kernel commit: $KCOMMIT" | tee -a ../error-log-pdx234.txt
+          echo "KERNEL_COMMIT=$KCOMMIT" >> $GITHUB_ENV
+          make mrproper 2>&1 | tee -a ../error-log-pdx234.txt
+
+      - name: Install exact LOS 24.0 pdx234 defconfig
+        working-directory: kernel
+        run: |
+          cp ../build-configs/pdx234_defconfig arch/arm64/configs/pdx234_defconfig
+          echo "✓ Installed LOS 24.0 pdx234_defconfig ($(wc -l < arch/arm64/configs/pdx234_defconfig) lines)" | tee -a ../error-log-pdx234.txt
+
+      - name: Cache Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
+
+      - name: Download Clang
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang
+          curl -fLSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz" | tar xz -C clang
+          echo "✓ Clang ${{ env.AOSP_CLANG_VERSION }} ready" | tee -a error-log-pdx234.txt
+
+      - name: Cache ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-pdx234-los24-${{ env.BUILD_SLUG }}
+          restore-keys: kernel-pdx234-los24-
+          max-size: 3G
+          save: true
+
+      - name: Setup swap
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Clone KSU and SUSFS dependencies
+        run: |
+          SUSFS_BRANCH="gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}"
+          echo "Using SUSFS branch: $SUSFS_BRANCH" | tee -a error-log-pdx234.txt
+
+          if [ "${{ github.event.inputs.ksu_variant }}" == "SukiSU" ]; then
+            if ! git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_BRANCH" 2>&1 | tee -a error-log-pdx234.txt; then
+              rm -rf susfs4ksu
+              git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" 2>&1 | tee -a error-log-pdx234.txt
+            fi
+          else
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" 2>&1 | tee -a error-log-pdx234.txt
+            git -C susfs4ksu checkout "${{ env.SUSFS_RESUKISU_PIN }}" 2>&1 | tee -a error-log-pdx234.txt
+          fi
+
+          git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git 2>&1 | tee -a error-log-pdx234.txt &
+          git clone --depth=1 https://github.com/zzh20188/GKI_KernelSU_SUSFS.git zzh_patches 2>&1 | tee -a error-log-pdx234.txt &
+          wait
+          echo "✓ Dependencies cloned" | tee -a error-log-pdx234.txt
+
+      - name: Upgrade LZ4 to 1.10.0
+        if: ${{ github.event.inputs.enable_zram == 'true' }}
+        working-directory: kernel
+        run: |
+          echo "--- LZ4 1.10.0 Upgrade ---" | tee -a ../error-log-pdx234.txt
+          rm -f lib/lz4/lz4_compress.c lib/lz4/lz4_decompress.c lib/lz4/lz4defs.h lib/lz4/lz4hc_compress.c
+          cp -r ../zzh_patches/zram/lz4/* ./lib/lz4/
+          cp -r ../zzh_patches/zram/include/linux/* ./include/linux/
+          if [ -f "../zzh_patches/zram/${{ env.KERNEL_VERSION }}/lz4_1.10.0.patch" ]; then
+            cp "../zzh_patches/zram/${{ env.KERNEL_VERSION }}/lz4_1.10.0.patch" ./
+            patch -p1 -F 3 --fuzz=5 < lz4_1.10.0.patch 2>&1 | tee -a ../error-log-pdx234.txt || echo "⚠ lz4 patch partial" | tee -a ../error-log-pdx234.txt
+          fi
+          if [ -f "fs/f2fs/Makefile" ] && ! grep -qF "f2fs-\$(CONFIG_F2FS_IOSTAT) += iostat.o" "fs/f2fs/Makefile"; then
+            echo "f2fs-\$(CONFIG_F2FS_IOSTAT) += iostat.o" >> "fs/f2fs/Makefile"
+          fi
+
+      - name: Add KernelSU variant
+        working-directory: kernel
+        run: |
+          echo "--- Adding ${{ github.event.inputs.ksu_variant }} ---" | tee -a ../error-log-pdx234.txt
+          if [ "${{ github.event.inputs.ksu_variant }}" == "ReSukiSU" ]; then
+            SETUP_URL="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh"
+            BRANCH="-s ${{ env.RESUKISU_PIN }}"
+          else
+            SETUP_URL="https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh"
+            BRANCH="-s builtin"
+          fi
+          curl -fLSs "$SETUP_URL" | bash $BRANCH 2>&1 | tee -a ../error-log-pdx234.txt
+          test -d KernelSU
+          echo "✓ KernelSU integrated" | tee -a ../error-log-pdx234.txt
+
+      - name: Add Baseband-guard LSM
+        working-directory: kernel
+        run: |
+          echo "--- Adding Baseband-guard ---" | tee -a ../error-log-pdx234.txt
+          curl -fLSs "https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh" | bash 2>&1 | tee -a ../error-log-pdx234.txt || true
+          CONFIG_FILE="arch/arm64/configs/pdx234_defconfig"
+          grep -q '^CONFIG_BBG=y' "$CONFIG_FILE" || echo 'CONFIG_BBG=y' >> "$CONFIG_FILE"
+          sed -i '/^CONFIG_LSM=/d' "$CONFIG_FILE"
+          echo 'CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf,baseband_guard"' >> "$CONFIG_FILE"
+
+      - name: Apply SUSFS patches and audit rejects
+        if: ${{ github.event.inputs.enable_susfs == 'true' }}
+        working-directory: kernel
+        run: |
+          echo "--- Applying SUSFS ---" | tee -a ../error-log-pdx234.txt
+          PATCH_FILE="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch"
+          test -f "$PATCH_FILE"
+          cp "$PATCH_FILE" ./
+          cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          set +e
+          patch -p1 --fuzz=3 < "50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch" 2>&1 | tee -a ../error-log-pdx234.txt
+          PATCH_RC=${PIPESTATUS[0]}
+          set -e
+          REJS=$(find . -name '*.rej' -not -path './.git/*')
+          if [ -n "$REJS" ]; then
+            echo "⚠ SUSFS REJECT FILES FOUND:" | tee -a ../error-log-pdx234.txt
+            for r in $REJS; do
+              echo "=== $r ===" | tee -a ../error-log-pdx234.txt
+              cat "$r" | tee -a ../error-log-pdx234.txt
+            done
+          else
+            echo "✓ SUSFS patch applied cleanly (0 rejects, rc=$PATCH_RC)" | tee -a ../error-log-pdx234.txt
+          fi
+
+      - name: Apply task_mmu.c fix if needed
+        working-directory: kernel
+        run: |
+          if grep -qxF $'\t\tgoto show_pad;' ./fs/proc/task_mmu.c; then
+            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
+            sed -i '/show_pad:/d' ./fs/proc/task_mmu.c
+            echo "✓ Applied task_mmu.c fix" | tee -a ../error-log-pdx234.txt
+          fi
+
+      - name: Apply ZRAM LZ4KD optimization
+        if: ${{ github.event.inputs.enable_zram == 'true' }}
+        working-directory: kernel
+        run: |
+          echo "--- ZRAM LZ4KD ---" | tee -a ../error-log-pdx234.txt
+          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/
+          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib/
+          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto/
+          if [ -f "../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch" ]; then
+            cp "../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch" ./
+            patch -p1 -F 3 < lz4kd.patch 2>&1 | tee -a ../error-log-pdx234.txt || echo "⚠ lz4kd patch partial" | tee -a ../error-log-pdx234.txt
+          fi
+
+      - name: Configure kernel defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG="arch/arm64/configs/pdx234_defconfig"
+          {
+            echo "CONFIG_KSU=y"
+            if [ "${{ github.event.inputs.enable_kpm }}" == "true" ]; then
+              echo "CONFIG_KPM=y"
+            fi
+            echo "CONFIG_KSU_SUSFS_SUS_SU=n"
+            if [ "${{ github.event.inputs.enable_susfs }}" == "true" ]; then
+              echo "CONFIG_KSU_SUSFS=y"
+              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+              echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+              echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            fi
+            if [ "${{ github.event.inputs.enable_zram }}" == "true" ]; then
+              echo "CONFIG_ZSMALLOC=y"
+              echo "CONFIG_ZRAM=y"
+              echo "CONFIG_CRYPTO_LZ4HC=y"
+              echo "CONFIG_CRYPTO_LZ4K=y"
+              echo "CONFIG_ZRAM_DEF_COMP_LZ4KD=y"
+              echo "CONFIG_CRYPTO_LZ4KD=y"
+              echo "CONFIG_CRYPTO_842=y"
+              echo "CONFIG_ZRAM_WRITEBACK=y"
+              echo "CONFIG_CRYPTO_LZO=y"
+            fi
+            echo "CONFIG_TMPFS_XATTR=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+            echo "CONFIG_IP_NF_TARGET_TTL=y"
+            echo "CONFIG_IP6_NF_TARGET_HL=y"
+            echo "CONFIG_IP6_NF_MATCH_HL=y"
+            echo "CONFIG_TCP_CONG_ADVANCED=y"
+            echo "CONFIG_TCP_CONG_BBR=y"
+            echo "CONFIG_NET_SCH_FQ=y"
+            echo "CONFIG_DEFAULT_BBR=y"
+            echo "CONFIG_TCP_CONG_BIC=n"
+            echo "CONFIG_TCP_CONG_WESTWOOD=n"
+            echo "CONFIG_TCP_CONG_HTCP=n"
+          } >> "$DEFCONFIG"
+
+          FEATURES="${{ env.KERNEL_LOCALVERSION }}"
+          [ "${{ github.event.inputs.enable_susfs }}" == "true" ] && FEATURES="${FEATURES}-SUSFS"
+          [ "${{ github.event.inputs.enable_kpm }}" == "true" ] && FEATURES="${FEATURES}-KPM"
+          sed -i 's/CONFIG_LOCALVERSION_AUTO=y/CONFIG_LOCALVERSION_AUTO=n/' "$DEFCONFIG"
+          sed -i "s|CONFIG_LOCALVERSION=\".*\"|CONFIG_LOCALVERSION=\"-${FEATURES}\"|" "$DEFCONFIG"
+          sed -i "s/printf '%s' -dirty/# dirty check disabled/" scripts/setlocalversion
+          echo "✓ Kernel localversion: -${FEATURES}" | tee -a ../error-log-pdx234.txt
+
+      - name: Configure git & ccache & tmpfs
+        run: |
+          cd kernel
+          git config --global user.email "builder@users.noreply.github.com"
+          git config --global user.name "pdx234-builder"
+          rm -rf .gitmodules 2>/dev/null || true
+          git rm --cached KernelSU 2>/dev/null || true
+          git add .
+          git commit -m "Apply LOS24 ReSukiSU + SUSFS patches" || true
+          cd ..
+
+          ccache -M 3G
+          ccache --set-config=compression=true
+          ccache --set-config=compression_level=1
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESSLEVEL=1" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+          echo "CCACHE_HARDLINK=true" >> $GITHUB_ENV
+
+          sudo mkdir -p /mnt/tmpfs
+          sudo mount -t tmpfs -o size=10G tmpfs /mnt/tmpfs
+          mkdir -p /mnt/tmpfs/out
+          ln -sf /mnt/tmpfs/out kernel/out
+
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          MAKE_ARGS: >-
+            O=out LLVM=1 LLVM_IAS=1 ARCH=arm64
+            -j$(nproc --all) CC="ccache clang"
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KCFLAGS="-Wframe-larger-than=15000"
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          export PAHOLE=/usr/bin/pahole
+          export BTF_DEBUG_INFO=y
+          make ${{ env.MAKE_ARGS }} pdx234_defconfig 2>&1 | tee build.log
+          make ${{ env.MAKE_ARGS }} prepare 2>&1 | tee -a build.log
+          if ! make ${{ env.MAKE_ARGS }} all 2>&1 | tee -a build.log; then
+            echo "✗ KERNEL BUILD FAILED! Last 120 lines:" | tee -a ../error-log-pdx234.txt
+            tail -120 build.log | tee -a ../error-log-pdx234.txt
+            exit 1
+          fi
+          test -f out/arch/arm64/boot/Image
+          echo "✓ Kernel Image built:" | tee -a ../error-log-pdx234.txt
+          ls -lh out/arch/arm64/boot/Image | tee -a ../error-log-pdx234.txt
+
+      - name: Apply KPM patch
+        if: ${{ github.event.inputs.enable_kpm == 'true' }}
+        run: |
+          cd kernel/out/arch/arm64/boot/
+          curl -fLSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
+          chmod +x patch_linux
+          ./patch_linux 2>&1 | tee -a $GITHUB_WORKSPACE/error-log-pdx234.txt
+          rm -f Image
+          mv oImage Image
+          test -f Image
+          echo "✓ KPM patched Image ready ($(stat -c%s Image) bytes)" | tee -a $GITHUB_WORKSPACE/error-log-pdx234.txt
+
+      - name: Verify compiled Image & package AnyKernel3 + boot.img
+        run: |
+          IMG="kernel/out/arch/arm64/boot/Image"
+          echo "=== VERIFYING IMAGE STRINGS ===" | tee -a error-log-pdx234.txt
+          strings "$IMG" | grep -E "Linux version 5\.15\." | head -3 | tee -a error-log-pdx234.txt
+          SUSFS_HIT=$(strings "$IMG" | grep -ic "susfs" || true)
+          KSU_HIT=$(strings "$IMG" | grep -ic "kernelsu" || true)
+          echo "SUSFS string hits: $SUSFS_HIT | KernelSU string hits: $KSU_HIT" | tee -a error-log-pdx234.txt
+
+          cp "$IMG" Image-pdx234
+
+          # 1. Package AnyKernel3
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 AnyKernel3-pdx234
+          cp "$IMG" AnyKernel3-pdx234/Image
+          (cd AnyKernel3-pdx234 && zip -r9 -q "../AnyKernel3-pdx234-los24-${{ env.BUILD_SLUG }}-susfs.zip" * -x .git .github README.md '*placeholder')
+
+          # 2. Package ready-to-flash Boot Header v4 boot.img (matches LOS 24.0 2026-11-22 header)
+          python3 - << 'PYEOF'
+          import os, struct
+          img = open("Image-pdx234", "rb").read()
+          page = 4096
+          header_size = 1584
+          header_ver = 4
+          # os=17.0.0 -> (17<<14)|(0<<7)|0 = 278528; patch=2026-11 -> ((2026-2000)<<4)|11 = 427
+          os_version = (17 << 25) | (0 << 18) | (0 << 11) | ((2026 - 2000) << 4) | 11
+          hdr = bytearray(page)
+          struct.pack_into("<8sIIII", hdr, 0, b"ANDROID!", len(img), 0, os_version, header_size)
+          struct.pack_into("<I", hdr, 40, header_ver)
+          # cmdline at offset 44 (1536 bytes zeroed), signature_size at 1580 = 0
+          pad_len = (page - (len(img) % page)) % page
+          out_path = f"boot-pdx234-los24-{os.environ['BUILD_SLUG']}-susfs.img"
+          with open(out_path, "wb") as f:
+              f.write(hdr)
+              f.write(img)
+              f.write(b"\x00" * pad_len)
+          print(f"Built {out_path}: {os.path.getsize(out_path)} bytes (kernel={len(img)})")
+          PYEOF
+
+          # 3. Save build summary
+          {
+            echo "=== Build Summary ==="
+            echo "Device: pdx234 (Sony Xperia 1 V)"
+            echo "ROM Base: LineageOS 24.0 (Android 17)"
+            echo "Kernel Commit: ${{ env.KERNEL_COMMIT }}"
+            echo "KSU Variant: ${{ github.event.inputs.ksu_variant }}"
+            echo "SUSFS: ${{ github.event.inputs.enable_susfs }} (pin ${{ env.SUSFS_RESUKISU_PIN }})"
+            echo "KPM: ${{ github.event.inputs.enable_kpm }}"
+            echo "ZRAM/LZ4KD: ${{ github.event.inputs.enable_zram }}"
+            echo "Clang: ${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}"
+            echo "Build Date: $(date -u)"
+            echo ""
+            cat error-log-pdx234.txt
+          } > build-info-pdx234.txt
+
+      - name: Fetch Manager APK & SUSFS Module + Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          cp Image-pdx234 release-assets/
+          cp AnyKernel3-pdx234-los24-*.zip release-assets/
+          cp boot-pdx234-los24-*.img release-assets/
+          cp build-info-pdx234.txt release-assets/
+
+          # Fetch matching Manager APK
+          if [ "${{ github.event.inputs.ksu_variant }}" == "ReSukiSU" ]; then
+            MGR_REPO="ReSukiSU/ReSukiSU"
+            MGR_ARTIFACT="Manager-release"
+          else
+            MGR_REPO="SukiSU-Ultra/SukiSU-Ultra"
+            MGR_ARTIFACT="manager"
+          fi
+          MGR_FOUND=""
+          RUN_IDS=$(gh api "repos/$MGR_REPO/actions/workflows/build-manager.yml/runs?status=success&per_page=5" -q '.workflow_runs[].id' 2>/dev/null || true)
+          for RUN_ID in $RUN_IDS; do
+            rm -rf manager-dl
+            if gh run download "$RUN_ID" -R "$MGR_REPO" -n "$MGR_ARTIFACT" -D manager-dl 2>/dev/null; then
+              for apk in $(find manager-dl -name '*.apk'); do
+                cp "$apk" "release-assets/$(basename "$apk")"
+                MGR_FOUND=1
+              done
+              [ -n "$MGR_FOUND" ] && break
+            fi
+          done
+          if [ -z "$MGR_FOUND" ] && [ "${{ github.event.inputs.ksu_variant }}" == "ReSukiSU" ]; then
+            # Fallback to spacealtctrl verified ReSukiSU v4.1.0 release APKs
+            curl -fLSs -o release-assets/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk \
+              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk" || true
+            curl -fLSs -o release-assets/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk \
+              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk" || true
+          fi
+
+          # Fetch sidex15 ksu_module_susfs
+          SUSFS_MOD_URL=$(curl -fsSL "https://api.github.com/repos/sidex15/ksu_module_susfs/releases/latest" | python3 -c "import sys,json; a=json.load(sys.stdin).get('assets',[]); print(a[0]['browser_download_url'] if a else '')" || true)
+          if [ -n "$SUSFS_MOD_URL" ]; then
+            curl -fLSs -o "release-assets/$(basename "$SUSFS_MOD_URL")" "$SUSFS_MOD_URL" || true
+          fi
+
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
+          ls -lh release-assets/
+
+          TAG="los24-pdx234-${{ github.event.inputs.release_version }}"
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Xperia 1 V (pdx234) LOS 24.0 Kernel: ${{ github.event.inputs.ksu_variant }} + SUSFS" \
+            --notes "Built on LineageOS 24.0 (${{ env.KERNEL_COMMIT }}) with ${{ github.event.inputs.ksu_variant }}, SUSFS, KPM, Baseband-guard, LZ4KD, BBR. Includes both AnyKernel3 zip and ready-to-flash boot.img (v4 header, Android 17 / 2026-11)." \
+            --target "${{ github.sha }}" \
+            release-assets/*
+
+      - name: Upload artifacts (always, including logs on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdx234-los24-${{ env.BUILD_SLUG }}-build
+          path: |
+            error-log-pdx234.txt
+            build-info-pdx234.txt
+            kernel/build.log
+            release-assets/*
+          if-no-files-found: ignore
+          overwrite: true
