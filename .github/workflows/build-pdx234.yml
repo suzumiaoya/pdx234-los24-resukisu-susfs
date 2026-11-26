@@ -129,9 +129,9 @@ jobs:
           cp ../build-configs/pdx234_defconfig arch/arm64/configs/pdx234_defconfig
           echo "✓ Installed LOS 24.0 pdx234_defconfig ($(wc -l < arch/arm64/configs/pdx234_defconfig) lines)" | tee -a ../error-log-pdx234.txt
 
-      - name: Cache Clang
+      - name: Restore Clang Cache
         id: cache-clang
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: clang
           key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
@@ -139,9 +139,27 @@ jobs:
       - name: Download Clang
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
-          mkdir -p clang
-          curl -fLSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz" | tar xz -C clang
-          echo "✓ Clang ${{ env.AOSP_CLANG_VERSION }} ready" | tee -a error-log-pdx234.txt
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ env.AOSP_TOOLCHAIN_BRANCH }}-release/clang-${{ env.AOSP_CLANG_VERSION }}.tar.gz"
+          for attempt in 1 2 3 4; do
+            rm -rf clang && mkdir -p clang
+            echo "Downloading Clang (attempt $attempt)..." | tee -a error-log-pdx234.txt
+            if curl -fLSs --retry 5 --retry-delay 5 --connect-timeout 30 "$URL" -o clang.tar.gz && tar xzf clang.tar.gz -C clang; then
+              rm -f clang.tar.gz
+              echo "✓ Clang ${{ env.AOSP_CLANG_VERSION }} ready" | tee -a error-log-pdx234.txt
+              exit 0
+            fi
+            rm -f clang.tar.gz
+            sleep $((attempt * 15))
+          done
+          echo "✗ Failed to download Clang after 4 attempts" | tee -a error-log-pdx234.txt
+          exit 1
+
+      - name: Save Clang Cache Immediately
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: clang
+          key: clang-${{ env.AOSP_TOOLCHAIN_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
 
       - name: Cache ccache
         uses: hendrikmuhs/ccache-action@v1.2
