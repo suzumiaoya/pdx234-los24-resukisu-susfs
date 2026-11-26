@@ -436,19 +436,24 @@ jobs:
         if: ${{ github.event.inputs.enable_kpm == 'true' }}
         run: |
           cd kernel/out/arch/arm64/boot/
-          curl -fLSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU_patch/refs/heads/main/kpm/patch_linux" -o patch_linux
+          if [ -f "$GITHUB_WORKSPACE/SukiSU_patch/kpm/patch_linux" ]; then
+            cp "$GITHUB_WORKSPACE/SukiSU_patch/kpm/patch_linux" ./patch_linux
+          else
+            curl -fLSs --retry 5 --retry-delay 5 "https://github.com/SukiSU-Nova/SukiSU_KernelPatch_patch/releases/download/0.14.0/patch_linux" -o patch_linux
+          fi
           chmod +x patch_linux
-          ./patch_linux 2>&1 | tee -a $GITHUB_WORKSPACE/error-log-pdx234.txt
+          ./patch_linux 2>&1 | tee -a "$GITHUB_WORKSPACE/error-log-pdx234.txt"
+          test -f oImage
           rm -f Image
           mv oImage Image
           test -f Image
-          echo "✓ KPM patched Image ready ($(stat -c%s Image) bytes)" | tee -a $GITHUB_WORKSPACE/error-log-pdx234.txt
+          echo "✓ KPM patched Image ready ($(stat -c%s Image) bytes)" | tee -a "$GITHUB_WORKSPACE/error-log-pdx234.txt"
 
       - name: Verify compiled Image & package AnyKernel3 + boot.img
         run: |
           IMG="kernel/out/arch/arm64/boot/Image"
           echo "=== VERIFYING IMAGE STRINGS ===" | tee -a error-log-pdx234.txt
-          strings "$IMG" | grep -E "Linux version 5\.15\." | head -3 | tee -a error-log-pdx234.txt
+          { strings "$IMG" | grep -m 3 -E "Linux version 5\.15\." || true; } | tee -a error-log-pdx234.txt
           SUSFS_HIT=$(strings "$IMG" | grep -ic "susfs" || true)
           KSU_HIT=$(strings "$IMG" | grep -ic "kernelsu" || true)
           echo "SUSFS string hits: $SUSFS_HIT | KernelSU string hits: $KSU_HIT" | tee -a error-log-pdx234.txt
@@ -508,38 +513,35 @@ jobs:
           cp boot-pdx234-los24-*.img release-assets/
           cp build-info-pdx234.txt release-assets/
 
-          # Fetch matching Manager APK
+          # Fetch matching Manager APK(s)
           if [ "${{ github.event.inputs.ksu_variant }}" == "ReSukiSU" ]; then
-            MGR_REPO="ReSukiSU/ReSukiSU"
-            MGR_ARTIFACT="Manager-release"
+            # Exact v4.1.0 APKs matching RESUKISU_PIN (normal + spoofed)
+            curl -fLSs --retry 5 --retry-delay 5 -o release-assets/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk \
+              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk"
+            curl -fLSs --retry 5 --retry-delay 5 -o release-assets/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk \
+              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk"
           else
-            MGR_REPO="SukiSU-Ultra/SukiSU-Ultra"
-            MGR_ARTIFACT="manager"
-          fi
-          MGR_FOUND=""
-          RUN_IDS=$(gh api "repos/$MGR_REPO/actions/workflows/build-manager.yml/runs?status=success&per_page=5" -q '.workflow_runs[].id' 2>/dev/null || true)
-          for RUN_ID in $RUN_IDS; do
-            rm -rf manager-dl
-            if gh run download "$RUN_ID" -R "$MGR_REPO" -n "$MGR_ARTIFACT" -D manager-dl 2>/dev/null; then
-              for apk in $(find manager-dl -name '*.apk'); do
-                cp "$apk" "release-assets/$(basename "$apk")"
-                MGR_FOUND=1
-              done
-              [ -n "$MGR_FOUND" ] && break
-            fi
-          done
-          if [ -z "$MGR_FOUND" ] && [ "${{ github.event.inputs.ksu_variant }}" == "ReSukiSU" ]; then
-            # Fallback to spacealtctrl verified ReSukiSU v4.1.0 release APKs
-            curl -fLSs -o release-assets/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk \
-              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0-spoofed_34943-arm64-v8a-release.apk" || true
-            curl -fLSs -o release-assets/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk \
-              "https://github.com/spacealtctrl/a16_sony_sm8550_SukiSU_SUSFS/releases/download/multi-device-v2.1.0-r4/ReSukiSU_v4.1.0_34943-arm64-v8a-release.apk" || true
+            RUN_IDS=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/workflows/build-manager.yml/runs?status=success&per_page=5" -q '.workflow_runs[].id' 2>/dev/null || true)
+            for RUN_ID in $RUN_IDS; do
+              rm -rf manager-dl
+              if gh run download "$RUN_ID" -R "SukiSU-Ultra/SukiSU-Ultra" -n "manager" -D manager-dl 2>/dev/null; then
+                for apk in $(find manager-dl -name '*.apk'); do
+                  cp "$apk" "release-assets/$(basename "$apk")"
+                done
+                break
+              fi
+            done
           fi
 
-          # Fetch sidex15 ksu_module_susfs
-          SUSFS_MOD_URL=$(curl -fsSL "https://api.github.com/repos/sidex15/ksu_module_susfs/releases/latest" | python3 -c "import sys,json; a=json.load(sys.stdin).get('assets',[]); print(a[0]['browser_download_url'] if a else '')" || true)
-          if [ -n "$SUSFS_MOD_URL" ]; then
-            curl -fLSs -o "release-assets/$(basename "$SUSFS_MOD_URL")" "$SUSFS_MOD_URL" || true
+          # Fetch sidex15 ksu_module_susfs (with clean decoded filename + fallback)
+          SUSFS_INFO=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/sidex15/ksu_module_susfs/releases/latest" | python3 -c "import sys,json; a=json.load(sys.stdin).get('assets',[]); print((a[0]['name'] + '|' + a[0]['browser_download_url']) if a else '')" || true)
+          if [ -n "$SUSFS_INFO" ]; then
+            SUSFS_NAME="${SUSFS_INFO%%|*}"
+            SUSFS_URL="${SUSFS_INFO#*|}"
+            curl -fLSs --retry 5 --retry-delay 5 -o "release-assets/$SUSFS_NAME" "$SUSFS_URL"
+          else
+            curl -fLSs --retry 5 --retry-delay 5 -o "release-assets/ksu_module_susfs_1.5.2+.zip" \
+              "https://github.com/sidex15/susfs4ksu-module/releases/download/v1.5.2%2B_R28/ksu_module_susfs_1.5.2%2B.zip"
           fi
 
           (cd release-assets && sha256sum * > SHA256SUMS.txt)
