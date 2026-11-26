@@ -249,7 +249,7 @@ jobs:
               )
               assert old1 in txt, "mnt_idmapping.h anchor not found"
               txt = txt.replace(old1, new1, 1)
-          if "CL_COPY_MNT_NS" not in txt:
+          if "#define CL_COPY_MNT_NS" not in txt:
               old2 = '/* Maximum number of mounts in a mount namespace */\n'
               new2 = (
                   '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
@@ -265,7 +265,8 @@ jobs:
               assert old2 in txt, "sysctl_mount_max anchor not found"
               txt = txt.replace(old2, new2, 1)
           open(p, "w", encoding="utf-8").write(txt)
-          print("✓ Manually applied fs/namespace.c Hunk #1 cleanly")
+          assert "#include <linux/susfs_def.h>" in txt and "#define CL_COPY_MNT_NS" in txt
+          print("✓ Manually applied fs/namespace.c Hunk #1 cleanly (verified both blocks)")
           PYFIX
             rm -f fs/namespace.c.rej
           fi
@@ -377,6 +378,7 @@ jobs:
           ccache -M 3G
           ccache --set-config=compression=true
           ccache --set-config=compression_level=1
+          ccache --set-config=compiler_check=content
           ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
           echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
           echo "CCACHE_COMPRESSLEVEL=1" >> $GITHUB_ENV
