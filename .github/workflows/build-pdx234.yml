@@ -171,10 +171,12 @@ jobs:
 
       - name: Setup swap
         run: |
-          sudo fallocate -l 10G /swapfile
+          sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+          df -h
+          free -h
 
       - name: Clone KSU and SUSFS dependencies
         run: |
@@ -403,10 +405,7 @@ jobs:
           echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
           echo "CCACHE_HARDLINK=true" >> $GITHUB_ENV
 
-          sudo mkdir -p /mnt/tmpfs
-          sudo mount -t tmpfs -o size=10G tmpfs /mnt/tmpfs
-          mkdir -p /mnt/tmpfs/out
-          ln -sf /mnt/tmpfs/out kernel/out
+          mkdir -p kernel/out
 
       - name: Build kernel
         working-directory: kernel
